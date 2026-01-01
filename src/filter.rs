@@ -249,6 +249,26 @@ impl<'a> FilterSource<'a> {
             }
         }
     }
+
+    /// Get the working directory of the repository being filtered.
+    pub fn workdir(&self) -> Option<std::path::PathBuf> {
+        unsafe {
+            let repo_ptr = raw::git_filter_source_repo(self.raw);
+            if repo_ptr.is_null() {
+                return None;
+            }
+            let path_ptr = raw::git_repository_workdir(repo_ptr);
+            if path_ptr.is_null() {
+                None
+            } else {
+                use std::ffi::CStr;
+                CStr::from_ptr(path_ptr)
+                    .to_str()
+                    .ok()
+                    .map(std::path::PathBuf::from)
+            }
+        }
+    }
 }
 
 /// Result of the filter check callback.
