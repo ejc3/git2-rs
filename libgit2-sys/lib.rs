@@ -93,6 +93,8 @@ pub enum git_worktree {}
 pub enum git_transaction {}
 pub enum git_mailmap {}
 pub enum git_indexer {}
+pub enum git_filter_list {}
+pub enum git_filter_source {}
 
 #[repr(C)]
 pub struct git_revspec {
@@ -2123,6 +2125,89 @@ git_enum! {
     }
 }
 
+// Filter mode: direction of filtering (smudge vs clean)
+git_enum! {
+    pub enum git_filter_mode_t {
+        GIT_FILTER_TO_WORKTREE = 0,
+        GIT_FILTER_TO_ODB = 1,
+    }
+}
+
+pub const GIT_FILTER_SMUDGE: git_filter_mode_t = GIT_FILTER_TO_WORKTREE;
+pub const GIT_FILTER_CLEAN: git_filter_mode_t = GIT_FILTER_TO_ODB;
+
+// Filter flags
+git_enum! {
+    pub enum git_filter_flag_t {
+        GIT_FILTER_DEFAULT = 0,
+        GIT_FILTER_ALLOW_UNSAFE = 1 << 0,
+        GIT_FILTER_NO_SYSTEM_ATTRIBUTES = 1 << 1,
+        GIT_FILTER_ATTRIBUTES_FROM_HEAD = 1 << 2,
+        GIT_FILTER_ATTRIBUTES_FROM_COMMIT = 1 << 3,
+    }
+}
+
+pub const GIT_FILTER_OPTIONS_VERSION: c_uint = 1;
+pub const GIT_FILTER_VERSION: c_uint = 1;
+
+// Filter priority constants
+pub const GIT_FILTER_CRLF_PRIORITY: c_int = 0;
+pub const GIT_FILTER_IDENT_PRIORITY: c_int = 100;
+pub const GIT_FILTER_DRIVER_PRIORITY: c_int = 200;
+
+#[repr(C)]
+pub struct git_filter_options {
+    pub version: c_uint,
+    pub flags: u32,
+    pub reserved: *mut c_void,
+    pub attr_commit_id: git_oid,
+}
+
+// Filter callback types
+pub type git_filter_init_fn = Option<unsafe extern "C" fn(filter: *mut git_filter) -> c_int>;
+pub type git_filter_shutdown_fn = Option<unsafe extern "C" fn(filter: *mut git_filter)>;
+pub type git_filter_check_fn = Option<
+    unsafe extern "C" fn(
+        filter: *mut git_filter,
+        payload: *mut *mut c_void,
+        src: *const git_filter_source,
+        attr_values: *mut *const c_char,
+    ) -> c_int,
+>;
+pub type git_filter_apply_fn = Option<
+    unsafe extern "C" fn(
+        filter: *mut git_filter,
+        payload: *mut *mut c_void,
+        to: *mut git_buf,
+        from: *const git_buf,
+        src: *const git_filter_source,
+    ) -> c_int,
+>;
+pub type git_filter_stream_fn = Option<
+    unsafe extern "C" fn(
+        out: *mut *mut git_writestream,
+        filter: *mut git_filter,
+        payload: *mut *mut c_void,
+        src: *const git_filter_source,
+        next: *mut git_writestream,
+    ) -> c_int,
+>;
+pub type git_filter_cleanup_fn =
+    Option<unsafe extern "C" fn(filter: *mut git_filter, payload: *mut c_void)>;
+
+/// Filter structure used to register custom filters.
+#[repr(C)]
+pub struct git_filter {
+    pub version: c_uint,
+    pub attributes: *const c_char,
+    pub initialize: git_filter_init_fn,
+    pub shutdown: git_filter_shutdown_fn,
+    pub check: git_filter_check_fn,
+    pub apply: git_filter_apply_fn,
+    pub stream: git_filter_stream_fn,
+    pub cleanup: git_filter_cleanup_fn,
+}
+
 extern "C" {
     // threads
     pub fn git_libgit2_init() -> c_int;
@@ -2790,6 +2875,85 @@ extern "C" {
         id: *mut git_oid,
         stream: *mut git_writestream,
     ) -> c_int;
+
+    // filter
+    pub fn git_filter_list_load(
+        filters: *mut *mut git_filter_list,
+        repo: *mut git_repository,
+        blob: *mut git_blob,
+        path: *const c_char,
+        mode: git_filter_mode_t,
+        flags: u32,
+    ) -> c_int;
+    pub fn git_filter_list_load_ext(
+        filters: *mut *mut git_filter_list,
+        repo: *mut git_repository,
+        blob: *mut git_blob,
+        path: *const c_char,
+        mode: git_filter_mode_t,
+        opts: *mut git_filter_options,
+    ) -> c_int;
+    pub fn git_filter_list_contains(filters: *mut git_filter_list, name: *const c_char) -> c_int;
+    pub fn git_filter_list_apply_to_buffer(
+        out: *mut git_buf,
+        filters: *mut git_filter_list,
+        input: *const c_char,
+        in_len: size_t,
+    ) -> c_int;
+    pub fn git_filter_list_apply_to_file(
+        out: *mut git_buf,
+        filters: *mut git_filter_list,
+        repo: *mut git_repository,
+        path: *const c_char,
+    ) -> c_int;
+    pub fn git_filter_list_apply_to_blob(
+        out: *mut git_buf,
+        filters: *mut git_filter_list,
+        blob: *mut git_blob,
+    ) -> c_int;
+    pub fn git_filter_list_stream_buffer(
+        filters: *mut git_filter_list,
+        buffer: *const c_char,
+        len: size_t,
+        target: *mut git_writestream,
+    ) -> c_int;
+    pub fn git_filter_list_stream_file(
+        filters: *mut git_filter_list,
+        repo: *mut git_repository,
+        path: *const c_char,
+        target: *mut git_writestream,
+    ) -> c_int;
+    pub fn git_filter_list_stream_blob(
+        filters: *mut git_filter_list,
+        blob: *mut git_blob,
+        target: *mut git_writestream,
+    ) -> c_int;
+    pub fn git_filter_list_free(filters: *mut git_filter_list);
+
+    // filter (sys) - custom filter registration
+    pub fn git_filter_lookup(name: *const c_char) -> *mut git_filter;
+    pub fn git_filter_list_new(
+        out: *mut *mut git_filter_list,
+        repo: *mut git_repository,
+        mode: git_filter_mode_t,
+        options: u32,
+    ) -> c_int;
+    pub fn git_filter_list_push(
+        fl: *mut git_filter_list,
+        filter: *mut git_filter,
+        payload: *mut c_void,
+    ) -> c_int;
+    pub fn git_filter_list_length(fl: *const git_filter_list) -> size_t;
+    pub fn git_filter_source_repo(src: *const git_filter_source) -> *mut git_repository;
+    pub fn git_filter_source_path(src: *const git_filter_source) -> *const c_char;
+    pub fn git_filter_source_filemode(src: *const git_filter_source) -> u16;
+    pub fn git_filter_source_id(src: *const git_filter_source) -> *const git_oid;
+    pub fn git_filter_source_mode(src: *const git_filter_source) -> git_filter_mode_t;
+    pub fn git_filter_source_flags(src: *const git_filter_source) -> u32;
+    pub fn git_filter_init(filter: *mut git_filter, version: c_uint) -> c_int;
+    pub fn git_filter_register(name: *const c_char, filter: *mut git_filter, priority: c_int)
+        -> c_int;
+    pub fn git_filter_unregister(name: *const c_char) -> c_int;
 
     // tree
     pub fn git_tree_entry_byid(tree: *const git_tree, id: *const git_oid) -> *const git_tree_entry;
