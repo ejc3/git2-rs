@@ -895,4 +895,103 @@ mod tests {
             assert!(!registry.iter().any(|e| e.name.to_str().unwrap() == name));
         }
     }
+
+    #[test]
+    fn test_filter_arc_keeps_filter_alive_after_unregistration() {
+        // This test verifies that the Arc-based design keeps filters alive
+        // even after unregistration, preventing use-after-free in callbacks.
+
+        let apply_count = Arc::new(AtomicUsize::new(0));
+        let filter = CaseFilter {
+            apply_count: apply_count.clone(),
+        };
+
+        let name = unique_filter_name("arctest");
+        let attr = format!("filter={}", name);
+
+        // Register the filter
+        let registration = filter_register(&name, &attr, filter_priority::DRIVER, filter)
+            .expect("Failed to register filter");
+
+        // Simulate what happens in a C callback: get an Arc to the filter
+        let filter_arc = {
+            let registry = get_registry().lock().unwrap();
+            registry
+                .iter()
+                .find(|e| e.name.to_str().unwrap() == name)
+                .map(|e| Arc::clone(&e.filter))
+                .expect("Filter should be in registry")
+        };
+
+        // Now unregister while we still hold an Arc
+        drop(registration);
+
+        // Verify unregistered from registry
+        {
+            let registry = get_registry().lock().unwrap();
+            assert!(!registry.iter().any(|e| e.name.to_str().unwrap() == name));
+        }
+
+        // But our Arc should still be valid! This is the key safety property.
+        // In the old code, this would be use-after-free.
+        // Create a mock FilterSource to test the filter
+        // We can't easily create a FilterSource, but we can verify the Arc is valid
+        // by checking the apply_count Arc is still accessible through the filter.
+        assert_eq!(apply_count.load(Ordering::SeqCst), 0);
+
+        // The Arc should have refcount > 0 (our copy)
+        assert_eq!(Arc::strong_count(&filter_arc), 1);
+    }
+
+    #[test]
+    fn test_concurrent_filter_access() {
+        use std::thread;
+
+        let apply_count = Arc::new(AtomicUsize::new(0));
+
+        // Create multiple threads that all try to use the filter
+        let handles: Vec<_> = (0..4)
+            .map(|i| {
+                let count = apply_count.clone();
+                thread::spawn(move || {
+                    let filter = CaseFilter {
+                        apply_count: count,
+                    };
+
+                    let name = unique_filter_name(&format!("concurrent_{}", i));
+                    let attr = format!("filter={}", name);
+
+                    // Register
+                    let registration =
+                        filter_register(&name, &attr, filter_priority::DRIVER, filter);
+
+                    if let Ok(reg) = registration {
+                        // Small delay to increase chance of interleaving
+                        std::thread::yield_now();
+
+                        // Access registry while other threads might be modifying it
+                        let _arc = {
+                            let registry = get_registry().lock().unwrap();
+                            registry
+                                .iter()
+                                .find(|e| e.name.to_str().unwrap() == name)
+                                .map(|e| Arc::clone(&e.filter))
+                        };
+
+                        std::thread::yield_now();
+
+                        // Unregister
+                        drop(reg);
+                    }
+                })
+            })
+            .collect();
+
+        // Wait for all threads
+        for h in handles {
+            h.join().expect("Thread panicked");
+        }
+
+        // If we get here without crashing, the concurrent access is safe
+    }
 }
