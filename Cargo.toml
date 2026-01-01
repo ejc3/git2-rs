@@ -21,6 +21,12 @@ bitflags = "2.1.0"
 libc = "0.2"
 log = "0.4.8"
 libgit2-sys = { path = "libgit2-sys", version = "0.18.3" }
+# LFS support (optional)
+sha2 = { version = "0.10", optional = true }
+ureq = { version = "2.10", optional = true, features = ["json"] }
+serde = { version = "1.0", optional = true, features = ["derive"] }
+serde_json = { version = "1.0", optional = true }
+base64 = { version = "0.22", optional = true }
 
 [target."cfg(all(unix, not(target_os = \"macos\")))".dependencies]
 openssl-sys = { version = "0.9.45", optional = true }
@@ -42,6 +48,8 @@ cred = ["dep:url"]
 vendored-libgit2 = ["libgit2-sys/vendored"]
 vendored-openssl = ["openssl-sys/vendored", "libgit2-sys/vendored-openssl"]
 zlib-ng-compat = ["libgit2-sys/zlib-ng-compat"]
+# LFS support - implements Git LFS protocol as a custom filter
+lfs = ["sha2", "ureq", "serde", "serde_json", "base64", "dep:url"]
 
 [workspace]
 members = ["systest", "git2-curl"]

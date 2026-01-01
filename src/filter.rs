@@ -336,20 +336,42 @@ impl Drop for FilterRegistration {
             let _ = raw::git_filter_unregister(self.name.as_ptr());
         }
 
-        // Clean up from registry
+        // Clean up from registry and free resources
         let mut registry = get_registry().lock().unwrap();
-        registry.retain(|entry| entry.name.as_c_str() != self.name.as_c_str());
+
+        // Find and remove the entry, freeing the raw_filter
+        let mut i = 0;
+        while i < registry.len() {
+            if registry[i].name.as_c_str() == self.name.as_c_str() {
+                let entry = registry.remove(i);
+                // Free the raw git_filter struct
+                unsafe {
+                    let _ = Box::from_raw(entry.raw_filter);
+                }
+                // entry.attributes (CString) is freed when entry drops
+                break;
+            } else {
+                i += 1;
+            }
+        }
     }
 }
+
+use std::sync::Arc;
 
 // Internal storage for registered filters
 struct FilterEntry {
     name: CString,
-    filter: Box<dyn Filter>,
+    #[allow(dead_code)] // Kept alive to back raw_filter.attributes pointer
+    attributes: CString,
+    filter: Arc<dyn Filter>, // Arc for safe sharing with callbacks
     raw_filter: *mut raw::git_filter,
 }
 
-// Safety: FilterEntry is Send because Filter is Send + Sync
+// Safety: FilterEntry is Send because:
+// - CString is Send
+// - Arc<dyn Filter> is Send (Filter: Send + Sync)
+// - raw_filter is only accessed while holding the registry mutex
 unsafe impl Send for FilterEntry {}
 
 use std::sync::OnceLock;
@@ -404,8 +426,8 @@ pub fn filter_register<F: Filter + 'static>(
     let name_cstr = CString::new(name)?;
     let attributes_cstr = CString::new(attributes)?;
 
-    // Box the filter
-    let filter_box: Box<dyn Filter> = Box::new(filter);
+    // Arc the filter for safe sharing with C callbacks
+    let filter_arc: Arc<dyn Filter> = Arc::new(filter);
 
     // Create the raw git_filter struct
     let raw_filter = Box::into_raw(Box::new(raw::git_filter {
@@ -419,10 +441,12 @@ pub fn filter_register<F: Filter + 'static>(
         cleanup: Some(filter_cleanup_cb),
     }));
 
-    // Store the entry
+    // Store the entry - attributes_cstr must live as long as raw_filter is registered
+    // because raw_filter.attributes points to attributes_cstr's data
     let entry = FilterEntry {
         name: name_cstr.clone(),
-        filter: filter_box,
+        attributes: attributes_cstr, // Ownership transferred here, keeps string alive
+        filter: filter_arc,
         raw_filter,
     };
 
@@ -435,16 +459,20 @@ pub fn filter_register<F: Filter + 'static>(
     unsafe {
         let rc = raw::git_filter_register(name_cstr.as_ptr(), raw_filter, priority);
         if rc < 0 {
-            // Clean up on failure
+            // Clean up on failure - remove entry which frees attributes and raw_filter
             let mut registry = get_registry().lock().unwrap();
-            registry.retain(|e| e.name.as_c_str() != name_cstr.as_c_str());
-            let _ = Box::from_raw(raw_filter);
+            let mut i = 0;
+            while i < registry.len() {
+                if registry[i].name.as_c_str() == name_cstr.as_c_str() {
+                    let entry = registry.remove(i);
+                    let _ = Box::from_raw(entry.raw_filter);
+                    break;
+                }
+                i += 1;
+            }
             return Err(Error::last_error(rc));
         }
     }
-
-    // Leak the attributes string - it must live as long as the filter is registered
-    std::mem::forget(attributes_cstr);
 
     Ok(FilterRegistration {
         name: name_cstr,
@@ -452,16 +480,15 @@ pub fn filter_register<F: Filter + 'static>(
     })
 }
 
-// Find filter by raw pointer
-fn find_filter(raw: *mut raw::git_filter) -> Option<&'static dyn Filter> {
+// Find filter by raw pointer and return a cloned Arc for safe use outside the lock
+fn find_filter(raw: *mut raw::git_filter) -> Option<Arc<dyn Filter>> {
     let registry = get_registry().lock().unwrap();
     for entry in registry.iter() {
         if entry.raw_filter == raw {
-            // Safety: The filter lives as long as the registry entry
-            // We return a 'static reference because the filter is Box<dyn Filter>
-            // stored in the registry, which lives until unregistration
-            let filter_ref: &dyn Filter = &*entry.filter;
-            return Some(unsafe { std::mem::transmute::<&dyn Filter, &'static dyn Filter>(filter_ref) });
+            // Clone the Arc - this is safe because:
+            // 1. We hold the lock while cloning
+            // 2. The Arc keeps the filter alive even if unregistered during callback
+            return Some(Arc::clone(&entry.filter));
         }
     }
     None
