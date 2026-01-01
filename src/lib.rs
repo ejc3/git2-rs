@@ -97,7 +97,10 @@ pub use crate::diff::{DiffBinary, DiffBinaryFile, DiffBinaryKind, DiffPatchidOpt
 pub use crate::diff::{DiffFindOptions, DiffHunk, DiffLine, DiffLineType, DiffStats};
 pub use crate::email::{Email, EmailCreateOptions};
 pub use crate::error::Error;
-pub use crate::filter::{FilterFlags, FilterList, FilterMode};
+pub use crate::filter::{
+    filter_priority, filter_register, Filter, FilterCheck, FilterFlags, FilterList, FilterMode,
+    FilterRegistration, FilterSource,
+};
 pub use crate::index::{
     Index, IndexConflict, IndexConflicts, IndexEntries, IndexEntry, IndexMatchedPath,
 };

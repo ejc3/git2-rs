@@ -198,6 +198,344 @@ impl<'repo> Drop for FilterList<'repo> {
     }
 }
 
+// ============================================================================
+// Filter Registration API
+// ============================================================================
+
+use std::ffi::CStr;
+use std::os::raw::c_void;
+use std::sync::Mutex;
+
+/// Information about the file being filtered.
+///
+/// This provides context to filter implementations about the source file.
+pub struct FilterSource<'a> {
+    raw: *const raw::git_filter_source,
+    _marker: marker::PhantomData<&'a ()>,
+}
+
+impl<'a> FilterSource<'a> {
+    fn from_raw(raw: *const raw::git_filter_source) -> Self {
+        FilterSource {
+            raw,
+            _marker: marker::PhantomData,
+        }
+    }
+
+    /// Get the path of the file being filtered, relative to the repository.
+    pub fn path(&self) -> Option<&str> {
+        unsafe {
+            let ptr = raw::git_filter_source_path(self.raw);
+            if ptr.is_null() {
+                None
+            } else {
+                CStr::from_ptr(ptr).to_str().ok()
+            }
+        }
+    }
+
+    /// Get the file mode of the source file.
+    pub fn filemode(&self) -> u16 {
+        unsafe { raw::git_filter_source_filemode(self.raw) }
+    }
+
+    /// Get the direction of filtering (to worktree or to odb).
+    pub fn mode(&self) -> FilterMode {
+        unsafe {
+            match raw::git_filter_source_mode(self.raw) {
+                raw::GIT_FILTER_TO_WORKTREE => FilterMode::ToWorktree,
+                raw::GIT_FILTER_TO_ODB => FilterMode::ToOdb,
+                _ => FilterMode::ToWorktree,
+            }
+        }
+    }
+}
+
+/// Result of the filter check callback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterCheck {
+    /// Apply this filter to the file.
+    Apply,
+    /// Skip this filter (passthrough).
+    Skip,
+}
+
+/// Trait for implementing custom Git filters.
+///
+/// Implement this trait to create filters that transform file content
+/// during checkout (smudge) and commit (clean) operations.
+///
+/// # Example
+///
+/// ```ignore
+/// use git2::{Filter, FilterSource, FilterMode, FilterCheck};
+///
+/// struct UppercaseFilter;
+///
+/// impl Filter for UppercaseFilter {
+///     fn check(&self, src: &FilterSource) -> Result<FilterCheck, git2::Error> {
+///         // Only apply to .txt files
+///         match src.path() {
+///             Some(p) if p.ends_with(".txt") => Ok(FilterCheck::Apply),
+///             _ => Ok(FilterCheck::Skip),
+///         }
+///     }
+///
+///     fn apply(&self, src: &FilterSource, input: &[u8]) -> Result<Vec<u8>, git2::Error> {
+///         match src.mode() {
+///             FilterMode::ToWorktree => Ok(input.to_ascii_uppercase()),
+///             FilterMode::ToOdb => Ok(input.to_ascii_lowercase()),
+///         }
+///     }
+/// }
+/// ```
+pub trait Filter: Send + Sync {
+    /// Check if this filter should be applied to the given file.
+    ///
+    /// Return `FilterCheck::Apply` to run the filter, or `FilterCheck::Skip` to pass through.
+    /// The default implementation always applies the filter.
+    fn check(&self, _src: &FilterSource<'_>) -> Result<FilterCheck, Error> {
+        Ok(FilterCheck::Apply)
+    }
+
+    /// Apply the filter to transform the content.
+    ///
+    /// - For `FilterMode::ToWorktree` (smudge): transform from repository to working directory
+    /// - For `FilterMode::ToOdb` (clean): transform from working directory to repository
+    fn apply(&self, src: &FilterSource<'_>, input: &[u8]) -> Result<Vec<u8>, Error>;
+
+    /// Called when the filter is being shut down.
+    ///
+    /// Override this to clean up resources. Default does nothing.
+    fn shutdown(&self) {}
+}
+
+/// Priority levels for filter registration.
+pub mod filter_priority {
+    /// Priority for CRLF filter (0).
+    pub const CRLF: i32 = 0;
+    /// Priority for ident filter (100).
+    pub const IDENT: i32 = 100;
+    /// Priority for driver/custom filters (200). Use this for LFS.
+    pub const DRIVER: i32 = 200;
+}
+
+/// A handle to a registered filter.
+///
+/// When dropped, the filter is unregistered.
+pub struct FilterRegistration {
+    name: CString,
+    // Prevent Send/Sync - must be dropped on same thread
+    _marker: marker::PhantomData<*mut ()>,
+}
+
+impl Drop for FilterRegistration {
+    fn drop(&mut self) {
+        unsafe {
+            // Ignore errors during unregistration
+            let _ = raw::git_filter_unregister(self.name.as_ptr());
+        }
+
+        // Clean up from registry
+        let mut registry = get_registry().lock().unwrap();
+        registry.retain(|entry| entry.name.as_c_str() != self.name.as_c_str());
+    }
+}
+
+// Internal storage for registered filters
+struct FilterEntry {
+    name: CString,
+    filter: Box<dyn Filter>,
+    raw_filter: *mut raw::git_filter,
+}
+
+// Safety: FilterEntry is Send because Filter is Send + Sync
+unsafe impl Send for FilterEntry {}
+
+use std::sync::OnceLock;
+
+static FILTER_REGISTRY: OnceLock<Mutex<Vec<FilterEntry>>> = OnceLock::new();
+
+fn get_registry() -> &'static Mutex<Vec<FilterEntry>> {
+    FILTER_REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Register a custom filter.
+///
+/// The filter will be applied to files matching the given attribute pattern.
+/// For example, to apply to files with `filter=lfs` in `.gitattributes`, use
+/// `attributes = "filter=lfs"`.
+///
+/// Returns a `FilterRegistration` handle. The filter remains registered until
+/// this handle is dropped.
+///
+/// # Arguments
+///
+/// * `name` - Unique name for the filter (e.g., "lfs")
+/// * `attributes` - Attribute pattern to match (e.g., "filter=lfs")
+/// * `priority` - Filter priority (use `filter_priority::DRIVER` for custom filters)
+/// * `filter` - The filter implementation
+///
+/// # Example
+///
+/// ```ignore
+/// use git2::{filter_register, filter_priority, Filter, FilterSource, FilterCheck};
+///
+/// struct MyFilter;
+/// impl Filter for MyFilter {
+///     fn apply(&self, _src: &FilterSource, input: &[u8]) -> Result<Vec<u8>, git2::Error> {
+///         Ok(input.to_vec())
+///     }
+/// }
+///
+/// let registration = filter_register("myfilter", "filter=myfilter", filter_priority::DRIVER, MyFilter)?;
+/// // Filter is now active
+/// drop(registration); // Unregisters the filter
+/// ```
+pub fn filter_register<F: Filter + 'static>(
+    name: &str,
+    attributes: &str,
+    priority: i32,
+    filter: F,
+) -> Result<FilterRegistration, Error> {
+    // Ensure libgit2 is initialized
+    crate::init();
+
+    let name_cstr = CString::new(name)?;
+    let attributes_cstr = CString::new(attributes)?;
+
+    // Box the filter
+    let filter_box: Box<dyn Filter> = Box::new(filter);
+
+    // Create the raw git_filter struct
+    let raw_filter = Box::into_raw(Box::new(raw::git_filter {
+        version: raw::GIT_FILTER_VERSION,
+        attributes: attributes_cstr.as_ptr(),
+        initialize: None,
+        shutdown: Some(filter_shutdown_cb),
+        check: Some(filter_check_cb),
+        apply: Some(filter_apply_cb),
+        stream: None, // We use apply, not stream
+        cleanup: Some(filter_cleanup_cb),
+    }));
+
+    // Store the entry
+    let entry = FilterEntry {
+        name: name_cstr.clone(),
+        filter: filter_box,
+        raw_filter,
+    };
+
+    {
+        let mut registry = get_registry().lock().unwrap();
+        registry.push(entry);
+    }
+
+    // Register with libgit2
+    unsafe {
+        let rc = raw::git_filter_register(name_cstr.as_ptr(), raw_filter, priority);
+        if rc < 0 {
+            // Clean up on failure
+            let mut registry = get_registry().lock().unwrap();
+            registry.retain(|e| e.name.as_c_str() != name_cstr.as_c_str());
+            let _ = Box::from_raw(raw_filter);
+            return Err(Error::last_error(rc));
+        }
+    }
+
+    // Leak the attributes string - it must live as long as the filter is registered
+    std::mem::forget(attributes_cstr);
+
+    Ok(FilterRegistration {
+        name: name_cstr,
+        _marker: marker::PhantomData,
+    })
+}
+
+// Find filter by raw pointer
+fn find_filter(raw: *mut raw::git_filter) -> Option<&'static dyn Filter> {
+    let registry = get_registry().lock().unwrap();
+    for entry in registry.iter() {
+        if entry.raw_filter == raw {
+            // Safety: The filter lives as long as the registry entry
+            // We return a 'static reference because the filter is Box<dyn Filter>
+            // stored in the registry, which lives until unregistration
+            let filter_ref: &dyn Filter = &*entry.filter;
+            return Some(unsafe { std::mem::transmute::<&dyn Filter, &'static dyn Filter>(filter_ref) });
+        }
+    }
+    None
+}
+
+// C callback: shutdown
+unsafe extern "C" fn filter_shutdown_cb(filter: *mut raw::git_filter) {
+    if let Some(f) = find_filter(filter) {
+        f.shutdown();
+    }
+}
+
+// C callback: check
+unsafe extern "C" fn filter_check_cb(
+    filter: *mut raw::git_filter,
+    _payload: *mut *mut c_void,
+    src: *const raw::git_filter_source,
+    _attr_values: *mut *const std::os::raw::c_char,
+) -> std::os::raw::c_int {
+    let Some(f) = find_filter(filter) else {
+        return raw::GIT_PASSTHROUGH;
+    };
+
+    let source = FilterSource::from_raw(src);
+    match f.check(&source) {
+        Ok(FilterCheck::Apply) => 0,
+        Ok(FilterCheck::Skip) => raw::GIT_PASSTHROUGH,
+        Err(_) => -1,
+    }
+}
+
+// C callback: apply
+unsafe extern "C" fn filter_apply_cb(
+    filter: *mut raw::git_filter,
+    _payload: *mut *mut c_void,
+    to: *mut raw::git_buf,
+    from: *const raw::git_buf,
+    src: *const raw::git_filter_source,
+) -> std::os::raw::c_int {
+    let Some(f) = find_filter(filter) else {
+        return raw::GIT_PASSTHROUGH;
+    };
+
+    let source = FilterSource::from_raw(src);
+
+    // Read input
+    let input = if (*from).ptr.is_null() || (*from).size == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts((*from).ptr as *const u8, (*from).size)
+    };
+
+    // Apply filter
+    match f.apply(&source, input) {
+        Ok(output) => {
+            // Write output to git_buf
+            let rc = raw::git_buf_set(to, output.as_ptr() as *const c_void, output.len());
+            if rc < 0 {
+                return rc;
+            }
+            0
+        }
+        Err(_) => -1,
+    }
+}
+
+// C callback: cleanup (per-file cleanup, not shutdown)
+unsafe extern "C" fn filter_cleanup_cb(
+    _filter: *mut raw::git_filter,
+    _payload: *mut c_void,
+) {
+    // Nothing to clean up per-file for our implementation
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -383,5 +721,151 @@ mod tests {
             None => {} // This is also valid
         }
         drop(filters_opt);
+    }
+
+    // ========================================================================
+    // Custom Filter Registration Tests
+    // ========================================================================
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    // Counter for generating unique filter names across tests
+    static TEST_FILTER_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+    fn unique_filter_name(prefix: &str) -> String {
+        let id = TEST_FILTER_COUNTER.fetch_add(1, Ordering::SeqCst);
+        format!("{}_{}", prefix, id)
+    }
+
+    /// A simple test filter that uppercases on clean, lowercases on smudge
+    struct CaseFilter {
+        apply_count: Arc<AtomicUsize>,
+    }
+
+    impl Filter for CaseFilter {
+        fn apply(&self, src: &FilterSource<'_>, input: &[u8]) -> Result<Vec<u8>, Error> {
+            self.apply_count.fetch_add(1, Ordering::SeqCst);
+            match src.mode() {
+                FilterMode::ToOdb => {
+                    // Clean: uppercase
+                    Ok(input.to_ascii_uppercase())
+                }
+                FilterMode::ToWorktree => {
+                    // Smudge: lowercase
+                    Ok(input.to_ascii_lowercase())
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_custom_filter_registration() {
+        let apply_count = Arc::new(AtomicUsize::new(0));
+        let filter = CaseFilter {
+            apply_count: apply_count.clone(),
+        };
+
+        let name = unique_filter_name("casefilter");
+        let attr = format!("filter={}", name);
+
+        // Register the filter
+        let registration = filter_register(&name, &attr, filter_priority::DRIVER, filter);
+        assert!(registration.is_ok(), "Failed to register filter: {:?}", registration.err());
+        let _reg = registration.unwrap();
+
+        // Filter is now registered - verify it exists in registry
+        let registry = get_registry().lock().unwrap();
+        assert!(registry.iter().any(|e| e.name.to_str().unwrap() == name));
+        drop(registry);
+
+        // When _reg is dropped, the filter will be unregistered
+    }
+
+    #[test]
+    fn test_custom_filter_with_gitattributes() {
+        let (td, repo) = repo_init();
+
+        let apply_count = Arc::new(AtomicUsize::new(0));
+        let filter = CaseFilter {
+            apply_count: apply_count.clone(),
+        };
+
+        let name = unique_filter_name("testcase");
+        let attr = format!("filter={}", name);
+
+        // Register the filter with a unique name for this test
+        let registration = filter_register(&name, &attr, filter_priority::DRIVER, filter)
+            .expect("Failed to register filter");
+
+        // Create .gitattributes to use our filter
+        let gitattributes_path = td.path().join(".gitattributes");
+        {
+            let mut file = File::create(&gitattributes_path).unwrap();
+            writeln!(file, "*.upper filter={}", name).unwrap();
+        }
+
+        // Add gitattributes to index
+        {
+            let mut index = repo.index().unwrap();
+            index
+                .add_path(std::path::Path::new(".gitattributes"))
+                .unwrap();
+            index.write().unwrap();
+        }
+
+        // Load filters for a .upper file
+        let filters = FilterList::load(
+            &repo,
+            "test.upper",
+            FilterMode::ToOdb,
+            FilterFlags::DEFAULT,
+        )
+        .unwrap();
+
+        // Should have our custom filter
+        if let Some(ref f) = filters {
+            assert!(f.contains(&name));
+
+            // Apply the filter
+            let input = b"hello world";
+            let output = f.apply_to_buffer(input).unwrap();
+            assert_eq!(output.as_ref(), b"HELLO WORLD");
+            assert_eq!(apply_count.load(Ordering::SeqCst), 1);
+        } else {
+            panic!("Expected filter list to be Some");
+        }
+
+        drop(filters);
+        drop(registration);
+    }
+
+    #[test]
+    fn test_filter_unregistration() {
+        let filter = CaseFilter {
+            apply_count: Arc::new(AtomicUsize::new(0)),
+        };
+
+        let name = unique_filter_name("tempfilter");
+        let attr = format!("filter={}", name);
+
+        // Register
+        let registration = filter_register(&name, &attr, filter_priority::DRIVER, filter)
+            .expect("Failed to register filter");
+
+        // Verify registered
+        {
+            let registry = get_registry().lock().unwrap();
+            assert!(registry.iter().any(|e| e.name.to_str().unwrap() == name));
+        }
+
+        // Drop to unregister
+        drop(registration);
+
+        // Verify unregistered
+        {
+            let registry = get_registry().lock().unwrap();
+            assert!(!registry.iter().any(|e| e.name.to_str().unwrap() == name));
+        }
     }
 }
